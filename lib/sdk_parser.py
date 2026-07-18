@@ -9,6 +9,7 @@ assistant/text -> result) is visible in the terminal output.
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime
 
 from claude_agent_sdk import (
@@ -46,21 +47,33 @@ def _project_root() -> str:
 
 
 def _log_file_handle():
+    """Open (and cache) the log file, falling back to a temp dir if the
+    project directory isn't writable -- e.g. a read-only serverless
+    filesystem like Vercel's, where only /tmp can be written to."""
     global _log_file
     if _log_file is None:
-        logs_dir = os.path.join(_project_root(), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
         timestamp = datetime.now().astimezone().strftime("%Y-%m-%dT%H-%M-%S%z")
-        log_path = os.path.join(logs_dir, f"{timestamp}.log")
-        _log_file = open(log_path, "a", encoding="utf-8")
+        try:
+            logs_dir = os.path.join(_project_root(), "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            log_path = os.path.join(logs_dir, f"{timestamp}.log")
+            _log_file = open(log_path, "a", encoding="utf-8")
+        except OSError:
+            logs_dir = os.path.join(tempfile.gettempdir(), "judge-logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            log_path = os.path.join(logs_dir, f"{timestamp}.log")
+            _log_file = open(log_path, "a", encoding="utf-8")
     return _log_file
 
 
 def _emit(text: str) -> None:
     print(text)
-    log_file = _log_file_handle()
-    log_file.write(_ANSI_RE.sub("", text) + "\n")
-    log_file.flush()
+    try:
+        log_file = _log_file_handle()
+        log_file.write(_ANSI_RE.sub("", text) + "\n")
+        log_file.flush()
+    except OSError:
+        pass
 
 
 def _c(color_name: str, text: str) -> str:
