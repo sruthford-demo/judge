@@ -265,8 +265,6 @@ class RoomManager:
         async with self._lock_for(code):
             room = await self._get_room(code)
             self._authorize(room, player_id, token)
-            if player_id != room.host_player_id:
-                raise NotHostError("Only the host can start a new game.")
             for p in room.players:
                 p.score = 0
                 p.card_id = None

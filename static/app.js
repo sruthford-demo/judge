@@ -370,7 +370,6 @@ function renderRoundReveal(data) {
 // ---- Game over ----
 function renderGameOver(data) {
   releaseWakeLock();
-  const isHost = session.playerId === data.host_player_id;
   const rows = data.final_scores
     .map((p) => `<li>${escapeHtml(p.name)} &mdash; ${p.score}</li>`)
     .join("");
@@ -378,24 +377,18 @@ function renderGameOver(data) {
     <section class="screen">
       <h2>\u{1F3C6} ${escapeHtml(data.winner.name)} wins!</h2>
       <ol class="final-scores">${rows}</ol>
-      ${
-        isHost
-          ? `<button id="new-game-btn" class="primary">Play Again</button>`
-          : `<p class="hint">Waiting for the host to start a new game&hellip;</p>`
-      }
+      <button id="new-game-btn" class="primary">Play Again</button>
     </section>
   `;
-  if (isHost) {
-    document.getElementById("new-game-btn").addEventListener("click", async () => {
-      try {
-        lastSnapshot = null;
-        const state = await api("POST", `/api/rooms/${data.room_code}/new-game`);
-        handleStateResponse(state);
-      } catch (err) {
-        alert(err.message);
-      }
-    });
-  }
+  document.getElementById("new-game-btn").addEventListener("click", async () => {
+    try {
+      lastSnapshot = null;
+      const state = await api("POST", `/api/rooms/${data.room_code}/new-game`);
+      handleStateResponse(state);
+    } catch (err) {
+      alert(err.message);
+    }
+  });
 }
 
 init();
