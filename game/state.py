@@ -7,18 +7,22 @@ dict when running locally with no store credentials configured.
 Each mutating RoomManager method loads the room, mutates it, and saves it
 back. There's no distributed lock across instances -- a deliberate
 simplification: actions here are human-paced and single-actor (only the
-current judge can judge_pick, ready-up is per-player), so the realistic
-collision window is tiny, and the worst case (e.g. two near-simultaneous
-"Next Round" taps) just raises InvalidPhaseError for the loser, which the
-UI already handles by re-polling. An asyncio.Lock per room code still
-guards against literal double-taps landing on the same warm instance.
+current judge can judge_pick), so the realistic collision window is tiny,
+and the worst case (e.g. two near-simultaneous "Next Round" taps) just
+raises InvalidPhaseError for the loser, which the UI already handles by
+re-polling. An asyncio.Lock per room code still guards against literal
+double-taps landing on the same warm instance.
+
+Non-judge players are assumed to be holding up their card the instant a
+round starts -- there's no explicit "I'm ready" confirmation step, so the
+judge can pick a loser as soon as the round begins.
 """
 
 import asyncio
 import random
 import secrets
 import string
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Literal
 
 from .cards import RESPONSE_BY_ID, RESPONSE_CARDS
@@ -80,7 +84,6 @@ class Player:
     name: str
     token: str
     score: int = 0
-    ready: bool = False
     card_id: str | None = None
 
 
@@ -120,10 +123,15 @@ class Room:
             if data["last_round_result"]
             else None
         )
+        # Filter to known fields so rooms persisted by a previous schema
+        # version (e.g. still carrying a since-removed "ready" key) don't
+        # crash on load -- Redis-stored data outlives any single deploy.
+        player_fields = {f.name for f in fields(Player)}
+        players = [Player(**{k: v for k, v in p.items() if k in player_fields}) for p in data["players"]]
         return cls(
             code=data["code"],
             host_player_id=data["host_player_id"],
-            players=[Player(**p) for p in data["players"]],
+            players=players,
             phase=data["phase"],
             round_number=data["round_number"],
             judge_player_id=data["judge_player_id"],
@@ -195,20 +203,6 @@ class RoomManager:
             return self._game_over_out(room)
         return self._state_out(room, player_id)
 
-    async def set_ready(self, code: str, player_id: str, token: str) -> RoomStateOut:
-        code = code.upper()
-        async with self._lock_for(code):
-            room = await self._get_room(code)
-            self._authorize(room, player_id, token)
-            if room.phase != "round":
-                raise InvalidPhaseError("There's no active round to ready up for.")
-            if player_id == room.judge_player_id:
-                raise NotJudgeError("The judge doesn't hold up a card.")
-            player = self._find_player(room, player_id)
-            player.ready = True
-            await self._store.set(code, room.to_dict())
-            return self._state_out(room, player_id)
-
     async def judge_pick(
         self, code: str, judge_player_id: str, token: str, loser_player_id: str
     ) -> RoomStateOut:
@@ -222,8 +216,6 @@ class RoomManager:
                 raise NotJudgeError("Only the current judge can pick the worst card.")
 
             non_judges = [p for p in room.players if p.id != room.judge_player_id]
-            if not all(p.ready for p in non_judges):
-                raise InvalidPhaseError("Not everyone has revealed their card yet.")
 
             loser = self._find_player(room, loser_player_id)
             if loser.id == room.judge_player_id:
@@ -277,7 +269,6 @@ class RoomManager:
                 raise NotHostError("Only the host can start a new game.")
             for p in room.players:
                 p.score = 0
-                p.ready = False
                 p.card_id = None
             room.last_round_result = None
             room.response_discard = []
@@ -317,7 +308,6 @@ class RoomManager:
         room.judge_player_id = room.players[judge_index].id
         room.phase = "round"
         for player in room.players:
-            player.ready = False
             player.card_id = (
                 None if player.id == room.judge_player_id else self._draw_response_card(room)
             )
@@ -342,17 +332,15 @@ class RoomManager:
             name=player.name,
             score=player.score,
             is_judge=player.id == room.judge_player_id,
-            ready=player.ready,
         )
 
     def _state_out(self, room: Room, requesting_player_id: str) -> RoomStateOut:
         requester = self._find_player(room, requesting_player_id)
         non_judges = [p for p in room.players if p.id != room.judge_player_id]
-        ready_count = sum(1 for p in non_judges if p.ready)
         am_i_judge = requesting_player_id == room.judge_player_id
 
         reveal_cards = None
-        if am_i_judge and room.phase == "round" and non_judges and ready_count == len(non_judges):
+        if am_i_judge and room.phase == "round" and non_judges:
             reveal_cards = [
                 SubmissionOut(player_id=p.id, name=p.name, card=self._card_out(p.card_id))
                 for p in non_judges
@@ -366,9 +354,6 @@ class RoomManager:
             judge_player_id=room.judge_player_id,
             am_i_judge=am_i_judge,
             my_card=self._card_out(requester.card_id) if room.phase == "round" else None,
-            my_ready=requester.ready,
-            ready_count=ready_count,
-            players_to_ready=len(non_judges),
             players=[self._player_public(room, p) for p in room.players],
             reveal_cards=reveal_cards,
             last_round_result=room.last_round_result,

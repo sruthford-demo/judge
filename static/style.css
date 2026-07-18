@@ -212,13 +212,6 @@ input[type="text"] {
   margin: 0;
 }
 
-/* Waiting screens */
-.wait-screen {
-  align-items: center;
-  text-align: center;
-  padding: 3rem 1rem;
-}
-
 /* Judge review */
 .reveal-grid {
   display: grid;

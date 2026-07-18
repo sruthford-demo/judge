@@ -142,15 +142,9 @@ function handleStateResponse(data) {
 
 function routeRound(data) {
   if (data.am_i_judge) {
-    if (data.ready_count < data.players_to_ready) {
-      renderJudgeWaiting(data);
-    } else {
-      renderJudgeReview(data);
-    }
-  } else if (!data.my_ready) {
-    renderMyCard(data);
+    renderJudgeReview(data);
   } else {
-    renderWaitingOnOthers(data);
+    renderMyCard(data);
   }
 }
 
@@ -287,40 +281,11 @@ function renderMyCard(data) {
   const card = data.my_card;
   APP.innerHTML = `
     <section class="screen forehead-screen">
-      <p class="hint">Hold your phone to your forehead, screen facing out, so everyone else can see it!</p>
+      <p class="hint">Hold your phone to your forehead, screen facing out, and keep it there until the judge picks!</p>
       <div class="forehead-card">
         <img src="${escapeHtml(card.image_url)}" alt="${escapeHtml(card.text)}" />
         <p class="forehead-caption">${card.emoji} ${escapeHtml(card.text)}</p>
       </div>
-      <button id="ready-btn" class="primary">I'm showing it!</button>
-    </section>
-  `;
-  document.getElementById("ready-btn").addEventListener("click", async () => {
-    try {
-      lastSnapshot = null;
-      const state = await api("POST", `/api/rooms/${data.room_code}/ready`);
-      handleStateResponse(state);
-    } catch (err) {
-      alert(err.message);
-    }
-  });
-}
-
-function renderWaitingOnOthers(data) {
-  APP.innerHTML = `
-    <section class="screen wait-screen">
-      <h2>Keep holding it up!</h2>
-      <p class="hint">Waiting for everyone to reveal (${data.ready_count}/${data.players_to_ready})&hellip;</p>
-    </section>
-  `;
-}
-
-function renderJudgeWaiting(data) {
-  releaseWakeLock();
-  APP.innerHTML = `
-    <section class="screen wait-screen">
-      <h2>You're the judge this round</h2>
-      <p class="hint">Waiting for everyone to hold up their card (${data.ready_count}/${data.players_to_ready})&hellip;</p>
     </section>
   `;
 }

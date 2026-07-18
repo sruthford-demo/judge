@@ -51,11 +51,6 @@ async def start_game(code: str, player_id: str = Header(..., alias="X-Player-Id"
     return await manager.start_game(code, player_id, player_token)
 
 
-@app.post("/api/rooms/{code}/ready", response_model=RoomStateOut)
-async def set_ready(code: str, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut:
-    return await manager.set_ready(code, player_id, player_token)
-
-
 @app.post("/api/rooms/{code}/judge/pick", response_model=RoomStateOut)
 async def judge_pick(code: str, body: JudgePickIn, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut:
     return await manager.judge_pick(code, player_id, player_token, body.loser_player_id)

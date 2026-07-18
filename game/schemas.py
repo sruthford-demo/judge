@@ -17,7 +17,6 @@ class PlayerPublic(BaseModel):
     name: str
     score: int
     is_judge: bool
-    ready: bool
 
 
 class SubmissionOut(BaseModel):
@@ -42,9 +41,6 @@ class RoomStateOut(BaseModel):
     judge_player_id: str | None
     am_i_judge: bool
     my_card: CardOut | None
-    my_ready: bool
-    ready_count: int
-    players_to_ready: int
     players: list[PlayerPublic]
     reveal_cards: list[SubmissionOut] | None = None
     last_round_result: RoundResultOut | None = None
