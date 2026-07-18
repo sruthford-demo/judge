@@ -1,26 +1,21 @@
-"""FastAPI app for Judge: a Cards-Against-Humanity-style party game judged by Claude.
+"""FastAPI app for Judge: a multi-device, Heads-Up-style party game.
 
 Run with: python main.py
-
-(Not `uvicorn main:app` directly -- lib/sdk_parser resolves its log directory
-relative to the running __main__ script, so the app needs to be launched as a
-script for logs/ to land in this project directory instead of wherever
-uvicorn's own entry point lives.)
 """
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from game.schemas import (
+    CreateRoomIn,
     GameOverOut,
-    GameStateOut,
-    HandOut,
-    RoundResultOut,
-    StartGameIn,
-    SubmitCardIn,
+    JoinRoomIn,
+    JudgePickIn,
+    RoomJoinedOut,
+    RoomStateOut,
 )
 from game.state import GameError, manager
 
@@ -34,40 +29,46 @@ async def game_error_handler(request, exc: GameError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
-@app.post("/api/game", response_model=GameStateOut)
-async def start_game(body: StartGameIn) -> GameStateOut:
-    return await manager.start_game(body.player_names)
+@app.post("/api/rooms", response_model=RoomJoinedOut)
+async def create_room(body: CreateRoomIn) -> RoomJoinedOut:
+    room, player = await manager.create_room(body.host_name)
+    return RoomJoinedOut(room_code=room.code, player_id=player.id, player_token=player.token)
 
 
-@app.get("/api/game", response_model=GameStateOut | GameOverOut)
-async def get_game() -> GameStateOut | GameOverOut:
-    return manager.get_state()
+@app.post("/api/rooms/{code}/join", response_model=RoomJoinedOut)
+async def join_room(code: str, body: JoinRoomIn) -> RoomJoinedOut:
+    room, player = await manager.join_room(code, body.name)
+    return RoomJoinedOut(room_code=room.code, player_id=player.id, player_token=player.token)
 
 
-@app.get("/api/game/players/{player_id}/hand", response_model=HandOut)
-async def get_hand(player_id: str) -> HandOut:
-    return manager.get_hand(player_id)
+@app.get("/api/rooms/{code}/state", response_model=RoomStateOut | GameOverOut)
+async def get_state(code: str, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut | GameOverOut:
+    return manager.get_state(code, player_id, player_token)
 
 
-@app.post("/api/game/players/{player_id}/submit", response_model=GameStateOut)
-async def submit_card(player_id: str, body: SubmitCardIn) -> GameStateOut:
-    return await manager.submit_card(player_id, body.card_id)
+@app.post("/api/rooms/{code}/start", response_model=RoomStateOut)
+async def start_game(code: str, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut:
+    return await manager.start_game(code, player_id, player_token)
 
 
-@app.post("/api/game/judge", response_model=RoundResultOut)
-async def judge_round() -> RoundResultOut:
-    return await manager.judge_round()
+@app.post("/api/rooms/{code}/ready", response_model=RoomStateOut)
+async def set_ready(code: str, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut:
+    return await manager.set_ready(code, player_id, player_token)
 
 
-@app.post("/api/game/next-round", response_model=GameStateOut | GameOverOut)
-async def next_round() -> GameStateOut | GameOverOut:
-    return await manager.next_round()
+@app.post("/api/rooms/{code}/judge/pick", response_model=RoomStateOut)
+async def judge_pick(code: str, body: JudgePickIn, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut:
+    return await manager.judge_pick(code, player_id, player_token, body.loser_player_id)
 
 
-@app.post("/api/game/reset")
-async def reset_game() -> dict:
-    await manager.reset()
-    return {}
+@app.post("/api/rooms/{code}/next-round", response_model=RoomStateOut | GameOverOut)
+async def next_round(code: str, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut | GameOverOut:
+    return await manager.next_round(code, player_id, player_token)
+
+
+@app.post("/api/rooms/{code}/new-game", response_model=RoomStateOut)
+async def new_game(code: str, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut:
+    return await manager.new_game(code, player_id, player_token)
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
@@ -76,4 +77,4 @@ app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

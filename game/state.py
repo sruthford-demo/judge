@@ -1,38 +1,45 @@
-"""In-memory game state and round lifecycle for a single local Judge game.
+"""In-memory multi-room state and round lifecycle for Judge.
 
-One game is active per server process (local pass-and-play, no persistence).
-All mutating GameManager methods take an asyncio.Lock so a double-tapped
-button can't corrupt state or double-judge a round.
+Rooms live in a process-wide dict keyed by room code -- no external store.
+This is a known, accepted tradeoff on Vercel's stateless serverless functions:
+state can occasionally reset under real concurrent multi-device load (a cold
+start, or requests landing on a different warm instance). Running
+`python main.py` locally (one process) is far more reliable for an actual
+in-person game than the Vercel deployment.
+
+Every mutating RoomManager method takes the room's own asyncio.Lock so a
+double-tapped button can't corrupt that room's state; separate rooms don't
+block each other.
 """
 
 import asyncio
 import random
+import secrets
+import string
 from dataclasses import dataclass, field
 from typing import Literal
-from uuid import uuid4
 
-from . import judge
-from .cards import PROMPT_BY_ID, PROMPT_CARDS, RESPONSE_BY_ID, RESPONSE_CARDS
+from .cards import RESPONSE_BY_ID, RESPONSE_CARDS
 from .schemas import (
     CardOut,
     GameOverOut,
-    GameStateOut,
-    HandOut,
     PlayerPublic,
+    RoomStateOut,
     RoundResultOut,
     SubmissionOut,
 )
 
-HAND_SIZE = 7
-TARGET_SCORE = 7
 MIN_PLAYERS = 4
+TARGET_SCORE = 5
+ROOM_CODE_CHARS = string.ascii_uppercase
+ROOM_CODE_LENGTH = 4
 
 
 class GameError(Exception):
     status_code = 400
 
 
-class NoActiveGameError(GameError):
+class RoomNotFoundError(GameError):
     status_code = 404
 
 
@@ -40,15 +47,27 @@ class UnknownPlayerError(GameError):
     status_code = 404
 
 
+class InvalidTokenError(GameError):
+    status_code = 403
+
+
 class InvalidPhaseError(GameError):
     status_code = 409
 
 
-class NotYourTurnError(GameError):
-    status_code = 409
+class NotHostError(GameError):
+    status_code = 403
 
 
-class CardNotInHandError(GameError):
+class NotJudgeError(GameError):
+    status_code = 403
+
+
+class DuplicateNameError(GameError):
+    status_code = 400
+
+
+class NotEnoughPlayersError(GameError):
     status_code = 400
 
 
@@ -56,271 +75,270 @@ class CardNotInHandError(GameError):
 class Player:
     id: str
     name: str
+    token: str
     score: int = 0
-    hand: list[str] = field(default_factory=list)
+    ready: bool = False
+    card_id: str | None = None
 
 
 @dataclass
-class Round:
-    number: int
-    prompt_id: str
-    pending_player_ids: list[str]
-    submissions: dict[str, str] = field(default_factory=dict)
-    submission_order: list[str] = field(default_factory=list)
-    phase: Literal["submitting", "judging", "reveal"] = "submitting"
-    winner_player_id: str | None = None
-    roast: str | None = None
-    judge_error: str | None = None
-
-
-@dataclass
-class Game:
-    id: str
-    players: list[Player]
-    round: Round
+class Room:
+    code: str
+    host_player_id: str
+    players: list[Player] = field(default_factory=list)
+    phase: Literal["lobby", "round", "reveal", "game_over"] = "lobby"
+    round_number: int = 0
+    judge_player_id: str | None = None
     response_deck: list[str] = field(default_factory=list)
     response_discard: list[str] = field(default_factory=list)
-    prompt_deck: list[str] = field(default_factory=list)
-    prompt_discard: list[str] = field(default_factory=list)
-    phase: Literal["in_round", "game_over"] = "in_round"
-    target_score: int = TARGET_SCORE
     last_round_result: RoundResultOut | None = None
+    target_score: int = TARGET_SCORE
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-class GameManager:
+class RoomManager:
     def __init__(self) -> None:
-        self._game: Game | None = None
-        self._lock = asyncio.Lock()
+        self._rooms: dict[str, Room] = {}
 
-    # -- public API -------------------------------------------------------
+    # -- room lifecycle -------------------------------------------------------
 
-    async def start_game(self, player_names: list[str]) -> GameStateOut:
-        async with self._lock:
-            names = [n.strip() for n in player_names if n.strip()]
-            if len(names) < MIN_PLAYERS:
-                raise GameError(f"At least {MIN_PLAYERS} player names are required.")
+    async def create_room(self, host_name: str) -> tuple[Room, Player]:
+        name = host_name.strip()
+        if not name:
+            raise GameError("Host name is required.")
+        code = self._new_room_code()
+        host = Player(id=_new_id(), name=name, token=_new_token())
+        room = Room(code=code, host_player_id=host.id, players=[host])
+        self._rooms[code] = room
+        return room, host
 
-            response_deck = [c.id for c in RESPONSE_CARDS]
-            random.shuffle(response_deck)
-            prompt_deck = [c.id for c in PROMPT_CARDS]
-            random.shuffle(prompt_deck)
+    async def join_room(self, code: str, name: str) -> tuple[Room, Player]:
+        room = self._get_room(code)
+        async with room.lock:
+            if room.phase != "lobby":
+                raise InvalidPhaseError("This game has already started.")
+            name = name.strip()
+            if not name:
+                raise GameError("Name is required.")
+            if any(p.name.lower() == name.lower() for p in room.players):
+                raise DuplicateNameError("That name is already taken in this room.")
+            player = Player(id=_new_id(), name=name, token=_new_token())
+            room.players.append(player)
+            return room, player
 
-            players = [Player(id=str(uuid4()), name=name) for name in names]
-            placeholder_round = Round(
-                number=0, prompt_id=PROMPT_CARDS[0].id, pending_player_ids=[]
-            )
+    async def start_game(self, code: str, player_id: str, token: str) -> RoomStateOut:
+        room = self._get_room(code)
+        async with room.lock:
+            self._authorize(room, player_id, token)
+            if player_id != room.host_player_id:
+                raise NotHostError("Only the host can start the game.")
+            if room.phase != "lobby":
+                raise InvalidPhaseError("The game has already started.")
+            if len(room.players) < MIN_PLAYERS:
+                raise NotEnoughPlayersError(f"Need at least {MIN_PLAYERS} players to start.")
 
-            self._game = Game(
-                id=str(uuid4()),
-                players=players,
-                round=placeholder_round,
-                response_deck=response_deck,
-                prompt_deck=prompt_deck,
-            )
+            room.response_deck = [c.id for c in RESPONSE_CARDS]
+            random.shuffle(room.response_deck)
+            self._begin_round(room, 1)
+            return self._state_out(room, player_id)
 
-            for player in players:
-                player.hand = self._draw_response_cards(HAND_SIZE)
+    def get_state(self, code: str, player_id: str, token: str) -> RoomStateOut | GameOverOut:
+        room = self._get_room(code)
+        self._authorize(room, player_id, token)
+        if room.phase == "game_over":
+            return self._game_over_out(room)
+        return self._state_out(room, player_id)
 
-            self._game.round = self._begin_round(1)
-            return self._state_out(self._game)
+    async def set_ready(self, code: str, player_id: str, token: str) -> RoomStateOut:
+        room = self._get_room(code)
+        async with room.lock:
+            self._authorize(room, player_id, token)
+            if room.phase != "round":
+                raise InvalidPhaseError("There's no active round to ready up for.")
+            if player_id == room.judge_player_id:
+                raise NotJudgeError("The judge doesn't hold up a card.")
+            player = self._find_player(room, player_id)
+            player.ready = True
+            return self._state_out(room, player_id)
 
-    def get_state(self) -> GameStateOut | GameOverOut:
-        game = self._require_game()
-        if game.phase == "game_over":
-            return self._game_over_out(game)
-        return self._state_out(game)
+    async def judge_pick(
+        self, code: str, judge_player_id: str, token: str, loser_player_id: str
+    ) -> RoomStateOut:
+        room = self._get_room(code)
+        async with room.lock:
+            self._authorize(room, judge_player_id, token)
+            if room.phase != "round":
+                raise InvalidPhaseError("There's no active round to judge.")
+            if judge_player_id != room.judge_player_id:
+                raise NotJudgeError("Only the current judge can pick the worst card.")
 
-    def get_hand(self, player_id: str) -> HandOut:
-        game = self._require_game()
-        player = self._find_player(game, player_id)
-        hand = [self._card_out(card_id) for card_id in player.hand]
-        return HandOut(
-            player_id=player.id,
-            name=player.name,
-            hand=hand,
-            has_submitted=player.id in game.round.submissions,
-        )
+            non_judges = [p for p in room.players if p.id != room.judge_player_id]
+            if not all(p.ready for p in non_judges):
+                raise InvalidPhaseError("Not everyone has revealed their card yet.")
 
-    async def submit_card(self, player_id: str, card_id: str) -> GameStateOut:
-        async with self._lock:
-            game = self._require_game()
-            round_ = game.round
-            if round_.phase != "submitting":
-                raise InvalidPhaseError("Submissions are closed for this round.")
-            if not round_.pending_player_ids or round_.pending_player_ids[0] != player_id:
-                raise NotYourTurnError("It's not this player's turn to submit.")
+            loser = self._find_player(room, loser_player_id)
+            if loser.id == room.judge_player_id:
+                raise GameError("The judge can't pick themself.")
+            loser.score += 1
 
-            player = self._find_player(game, player_id)
-            if card_id not in player.hand:
-                raise CardNotInHandError("That card is not in this player's hand.")
-
-            player.hand.remove(card_id)
-            round_.submissions[player_id] = card_id
-            round_.pending_player_ids.pop(0)
-
-            if not round_.pending_player_ids:
-                order = [p.id for p in game.players]
-                random.shuffle(order)
-                round_.submission_order = order
-                round_.phase = "judging"
-
-            return self._state_out(game)
-
-    async def judge_round(self) -> RoundResultOut:
-        async with self._lock:
-            game = self._require_game()
-            round_ = game.round
-            if round_.phase != "judging":
-                raise InvalidPhaseError("This round is not ready to be judged.")
-
-            prompt = PROMPT_BY_ID[round_.prompt_id]
-            texts = [
-                RESPONSE_BY_ID[round_.submissions[pid]].text for pid in round_.submission_order
-            ]
-
-            result = await judge.judge_round(prompt.text, texts)
-
-            winner_player_id = round_.submission_order[result.winner_index]
-            winner_player = self._find_player(game, winner_player_id)
-            winner_player.score += 1
-
-            round_.winner_player_id = winner_player_id
-            round_.roast = result.roast
-            round_.judge_error = result.error
-            round_.phase = "reveal"
-
+            judge = self._find_player(room, judge_player_id)
             submissions_out = [
-                SubmissionOut(
-                    player_id=pid,
-                    name=self._find_player(game, pid).name,
-                    card=self._card_out(round_.submissions[pid]),
-                )
-                for pid in round_.submission_order
+                SubmissionOut(player_id=p.id, name=p.name, card=self._card_out(p.card_id))
+                for p in non_judges
             ]
-            winner_out = next(s for s in submissions_out if s.player_id == winner_player_id)
+            loser_out = next(s for s in submissions_out if s.player_id == loser.id)
 
-            result_out = RoundResultOut(
-                round_number=round_.number,
-                prompt=self._prompt_out(round_.prompt_id),
-                winner=winner_out,
-                roast=result.roast,
+            room.last_round_result = RoundResultOut(
+                round_number=room.round_number,
+                judge_name=judge.name,
+                loser=loser_out,
                 submissions=submissions_out,
-                scores=[self._player_public(p, round_) for p in game.players],
-                judge_error=result.error,
+                scores=[self._player_public(room, p) for p in room.players],
             )
-            game.last_round_result = result_out
-            return result_out
+            room.response_discard.extend(p.card_id for p in non_judges if p.card_id)
+            room.phase = "reveal"
+            return self._state_out(room, judge_player_id)
 
-    async def next_round(self) -> GameStateOut | GameOverOut:
-        async with self._lock:
-            game = self._require_game()
-            if game.round.phase != "reveal":
+    async def next_round(
+        self, code: str, player_id: str, token: str
+    ) -> RoomStateOut | GameOverOut:
+        room = self._get_room(code)
+        async with room.lock:
+            self._authorize(room, player_id, token)
+            if room.phase != "reveal":
                 raise InvalidPhaseError("The current round hasn't been judged yet.")
 
-            if any(p.score >= game.target_score for p in game.players):
-                game.phase = "game_over"
-                return self._game_over_out(game)
+            if any(p.score >= room.target_score for p in room.players):
+                room.phase = "game_over"
+                return self._game_over_out(room)
 
-            game.response_discard.extend(game.round.submissions.values())
-            for player in game.players:
-                refill = self._draw_response_cards(HAND_SIZE - len(player.hand))
-                player.hand.extend(refill)
+            self._begin_round(room, room.round_number + 1)
+            return self._state_out(room, player_id)
 
-            game.round = self._begin_round(game.round.number + 1)
-            return self._state_out(game)
+    async def new_game(self, code: str, player_id: str, token: str) -> RoomStateOut:
+        room = self._get_room(code)
+        async with room.lock:
+            self._authorize(room, player_id, token)
+            if player_id != room.host_player_id:
+                raise NotHostError("Only the host can start a new game.")
+            for p in room.players:
+                p.score = 0
+                p.ready = False
+                p.card_id = None
+            room.last_round_result = None
+            room.response_discard = []
+            self._begin_round(room, 1)
+            return self._state_out(room, player_id)
 
-    async def reset(self) -> None:
-        async with self._lock:
-            self._game = None
+    # -- internal helpers -------------------------------------------------------
 
-    # -- internal helpers ---------------------------------------------------
+    def _new_room_code(self) -> str:
+        while True:
+            code = "".join(secrets.choice(ROOM_CODE_CHARS) for _ in range(ROOM_CODE_LENGTH))
+            if code not in self._rooms:
+                return code
 
-    def _require_game(self) -> Game:
-        if self._game is None:
-            raise NoActiveGameError("No active game. Start a new game first.")
-        return self._game
+    def _get_room(self, code: str) -> Room:
+        room = self._rooms.get(code.upper())
+        if room is None:
+            raise RoomNotFoundError(f"No room with code {code!r}.")
+        return room
 
-    def _find_player(self, game: Game, player_id: str) -> Player:
-        for player in game.players:
+    def _authorize(self, room: Room, player_id: str, token: str) -> Player:
+        player = self._find_player(room, player_id)
+        if not secrets.compare_digest(player.token, token or ""):
+            raise InvalidTokenError("Invalid player token.")
+        return player
+
+    def _find_player(self, room: Room, player_id: str) -> Player:
+        for player in room.players:
             if player.id == player_id:
                 return player
         raise UnknownPlayerError(f"Unknown player_id {player_id!r}")
 
-    def _begin_round(self, number: int) -> Round:
-        prompt_id = self._draw_prompt()
-        pending = self._turn_order(number)
-        return Round(number=number, prompt_id=prompt_id, pending_player_ids=pending)
+    def _begin_round(self, room: Room, number: int) -> None:
+        room.round_number = number
+        judge_index = (number - 1) % len(room.players)
+        room.judge_player_id = room.players[judge_index].id
+        room.phase = "round"
+        for player in room.players:
+            player.ready = False
+            player.card_id = (
+                None if player.id == room.judge_player_id else self._draw_response_card(room)
+            )
 
-    def _turn_order(self, round_number: int) -> list[str]:
-        game = self._game
-        assert game is not None
-        ids = [p.id for p in game.players]
-        offset = (round_number - 1) % len(ids)
-        return ids[offset:] + ids[:offset]
+    def _draw_response_card(self, room: Room) -> str:
+        if not room.response_deck:
+            room.response_deck, room.response_discard = room.response_discard, []
+            random.shuffle(room.response_deck)
+        return room.response_deck.pop()
 
-    def _draw_prompt(self) -> str:
-        game = self._game
-        assert game is not None
-        if not game.prompt_deck:
-            game.prompt_deck, game.prompt_discard = game.prompt_discard, []
-            random.shuffle(game.prompt_deck)
-        prompt_id = game.prompt_deck.pop()
-        game.prompt_discard.append(prompt_id)
-        return prompt_id
-
-    def _draw_response_cards(self, n: int) -> list[str]:
-        game = self._game
-        assert game is not None
-        drawn: list[str] = []
-        for _ in range(n):
-            if not game.response_deck:
-                if not game.response_discard:
-                    break
-                game.response_deck, game.response_discard = game.response_discard, []
-                random.shuffle(game.response_deck)
-            drawn.append(game.response_deck.pop())
-        return drawn
-
-    def _card_out(self, card_id: str) -> CardOut:
+    def _card_out(self, card_id: str | None) -> CardOut | None:
+        if card_id is None:
+            return None
         c = RESPONSE_BY_ID[card_id]
-        return CardOut(id=c.id, text=c.text, emoji=c.emoji)
+        return CardOut(
+            id=c.id, text=c.text, emoji=c.emoji, image_url=f"/card-images/{c.id}.webp"
+        )
 
-    def _prompt_out(self, prompt_id: str) -> CardOut:
-        c = PROMPT_BY_ID[prompt_id]
-        return CardOut(id=c.id, text=c.text, emoji=c.emoji)
-
-    def _player_public(self, player: Player, round_: Round) -> PlayerPublic:
+    def _player_public(self, room: Room, player: Player) -> PlayerPublic:
         return PlayerPublic(
             id=player.id,
             name=player.name,
             score=player.score,
-            hand_size=len(player.hand),
-            has_submitted=player.id in round_.submissions,
+            is_judge=player.id == room.judge_player_id,
+            ready=player.ready,
         )
 
-    def _state_out(self, game: Game) -> GameStateOut:
-        current_player_id = (
-            game.round.pending_player_ids[0]
-            if game.round.phase == "submitting" and game.round.pending_player_ids
-            else None
-        )
-        return GameStateOut(
-            game_id=game.id,
-            phase=game.round.phase,
-            round_number=game.round.number,
-            prompt=self._prompt_out(game.round.prompt_id),
-            players=[self._player_public(p, game.round) for p in game.players],
-            current_player_id=current_player_id,
-            last_round_result=game.last_round_result,
+    def _state_out(self, room: Room, requesting_player_id: str) -> RoomStateOut:
+        requester = self._find_player(room, requesting_player_id)
+        non_judges = [p for p in room.players if p.id != room.judge_player_id]
+        ready_count = sum(1 for p in non_judges if p.ready)
+        am_i_judge = requesting_player_id == room.judge_player_id
+
+        reveal_cards = None
+        if am_i_judge and room.phase == "round" and non_judges and ready_count == len(non_judges):
+            reveal_cards = [
+                SubmissionOut(player_id=p.id, name=p.name, card=self._card_out(p.card_id))
+                for p in non_judges
+            ]
+
+        return RoomStateOut(
+            room_code=room.code,
+            phase=room.phase,
+            host_player_id=room.host_player_id,
+            round_number=room.round_number,
+            judge_player_id=room.judge_player_id,
+            am_i_judge=am_i_judge,
+            my_card=self._card_out(requester.card_id) if room.phase == "round" else None,
+            my_ready=requester.ready,
+            ready_count=ready_count,
+            players_to_ready=len(non_judges),
+            players=[self._player_public(room, p) for p in room.players],
+            reveal_cards=reveal_cards,
+            last_round_result=room.last_round_result,
         )
 
-    def _game_over_out(self, game: Game) -> GameOverOut:
+    def _game_over_out(self, room: Room) -> GameOverOut:
         ranked = sorted(
-            (self._player_public(p, game.round) for p in game.players),
+            (self._player_public(room, p) for p in room.players),
             key=lambda p: p.score,
             reverse=True,
         )
-        return GameOverOut(winner=ranked[0], final_scores=ranked)
+        return GameOverOut(
+            room_code=room.code,
+            host_player_id=room.host_player_id,
+            winner=ranked[0],
+            final_scores=ranked,
+        )
 
 
-manager = GameManager()
+def _new_id() -> str:
+    return secrets.token_hex(8)
+
+
+def _new_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+manager = RoomManager()

@@ -3,13 +3,11 @@
   --fg: #1a1a1a;
   --card-black-bg: #111;
   --card-black-fg: #fff;
-  --card-white-bg: #fff;
-  --card-white-fg: #111;
   --accent: #d1495b;
   --accent-fg: #fff;
   --muted: #6b6b6b;
   --border: #ddd;
-  --winner: #f2c94c;
+  --loser: #f2c94c;
 }
 
 * {
@@ -40,6 +38,19 @@ body {
   letter-spacing: 0.02em;
 }
 
+.room-code-badge {
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  background: rgba(255, 255, 255, 0.12);
+  padding: 0.25rem 0.6rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.room-code-badge.hidden {
+  display: none;
+}
+
 .scoreboard {
   display: flex;
   gap: 0.5rem;
@@ -55,6 +66,12 @@ body {
   padding: 0.25rem 0.6rem;
   border-radius: 999px;
   font-size: 0.85rem;
+}
+
+.score-pill.judge {
+  background: var(--loser);
+  color: #111;
+  font-weight: 700;
 }
 
 main#app {
@@ -110,122 +127,132 @@ button.primary:disabled {
   cursor: not-allowed;
 }
 
-/* Setup */
-#player-inputs {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.player-input-row {
-  display: flex;
-  gap: 0.5rem;
-}
-
-.player-input-row input {
-  flex: 1;
+input[type="text"] {
+  width: 100%;
   padding: 0.6rem 0.75rem;
   border-radius: 8px;
   border: 1px solid var(--border);
   font: inherit;
 }
 
-.remove-player {
-  padding: 0.5rem 0.7rem;
+/* Home */
+.home-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
 }
 
-/* Pass device */
-.pass-screen {
+.home-card {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.home-card h3 {
+  margin: 0;
+}
+
+/* Lobby */
+.lobby-screen {
+  align-items: center;
+  text-align: center;
+}
+
+.room-code-big {
+  font-size: 3rem;
+  font-weight: 800;
+  letter-spacing: 0.2em;
+  margin: 0;
+}
+
+.player-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+/* Forehead display */
+.forehead-screen {
+  align-items: center;
+  text-align: center;
+}
+
+.forehead-card {
+  width: 100%;
+  background: var(--card-black-bg);
+  color: var(--card-black-fg);
+  border-radius: 16px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.forehead-card img {
+  width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.forehead-caption {
+  font-size: 1.3rem;
+  font-weight: 700;
+  margin: 0;
+}
+
+/* Waiting screens */
+.wait-screen {
   align-items: center;
   text-align: center;
   padding: 3rem 1rem;
 }
 
-.player-name-big {
-  font-size: 2rem;
-  font-weight: 800;
-}
-
-/* Prompt card */
-.prompt-card {
-  background: var(--card-black-bg);
-  color: var(--card-black-fg);
-  border-radius: 16px;
-  padding: 1.5rem;
-  min-height: 120px;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  font-size: 1.15rem;
-  font-weight: 600;
-}
-
-.prompt-emoji {
-  font-size: 1.6rem;
-}
-
-.blank {
-  border-bottom: 3px solid #fff;
-}
-
-/* Cards */
-.card-grid {
+/* Judge review */
+.reveal-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 0.75rem;
+  gap: 1rem;
 }
 
-.response-card {
-  background: var(--card-white-bg);
-  color: var(--card-white-fg);
-  border: 2px solid var(--border);
-  border-radius: 12px;
-  padding: 1rem;
-  min-height: 110px;
+.reveal-card {
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 0.5rem;
-  text-align: left;
-  font-weight: 600;
-  font-size: 0.95rem;
-}
-
-.response-card.static {
-  cursor: default;
-  min-height: 90px;
-}
-
-.response-card.selected {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent);
-}
-
-.card-emoji {
-  font-size: 1.5rem;
-}
-
-/* Reveal */
-.roast-box {
-  background: #fff8e6;
-  border: 2px solid var(--winner);
+  padding: 0.5rem;
+  background: #fff;
+  border: 2px solid var(--border);
   border-radius: 12px;
-  padding: 1rem;
 }
 
-.roast-label {
-  margin: 0 0 0.25rem;
+.reveal-card:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.reveal-card img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 8px;
+}
+
+.reveal-name {
   font-weight: 700;
-  text-transform: uppercase;
-  font-size: 0.75rem;
-  color: var(--muted);
 }
 
-.roast-text {
-  margin: 0;
-  font-size: 1.1rem;
-  font-style: italic;
-}
-
+/* Round reveal */
 .submissions-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
@@ -239,9 +266,17 @@ button.primary:disabled {
   align-items: center;
 }
 
-.submission.winner .response-card {
-  border-color: var(--winner);
-  box-shadow: 0 0 0 3px var(--winner);
+.submission img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 2px solid var(--border);
+}
+
+.submission.loser img {
+  border-color: var(--loser);
+  box-shadow: 0 0 0 3px var(--loser);
 }
 
 .submission-name {

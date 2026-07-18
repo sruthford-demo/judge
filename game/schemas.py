@@ -9,14 +9,15 @@ class CardOut(BaseModel):
     id: str
     text: str
     emoji: str
+    image_url: str
 
 
 class PlayerPublic(BaseModel):
     id: str
     name: str
     score: int
-    hand_size: int
-    has_submitted: bool
+    is_judge: bool
+    ready: bool
 
 
 class SubmissionOut(BaseModel):
@@ -27,40 +28,49 @@ class SubmissionOut(BaseModel):
 
 class RoundResultOut(BaseModel):
     round_number: int
-    prompt: CardOut
-    winner: SubmissionOut
-    roast: str
+    judge_name: str
+    loser: SubmissionOut
     submissions: list[SubmissionOut]
     scores: list[PlayerPublic]
-    judge_error: str | None = None
 
 
-class GameStateOut(BaseModel):
-    game_id: str
-    phase: Literal["submitting", "judging", "reveal"]
+class RoomStateOut(BaseModel):
+    room_code: str
+    phase: Literal["lobby", "round", "reveal"]
+    host_player_id: str
     round_number: int
-    prompt: CardOut
+    judge_player_id: str | None
+    am_i_judge: bool
+    my_card: CardOut | None
+    my_ready: bool
+    ready_count: int
+    players_to_ready: int
     players: list[PlayerPublic]
-    current_player_id: str | None
+    reveal_cards: list[SubmissionOut] | None = None
     last_round_result: RoundResultOut | None = None
 
 
 class GameOverOut(BaseModel):
     phase: Literal["game_over"] = "game_over"
+    room_code: str
+    host_player_id: str
     winner: PlayerPublic
     final_scores: list[PlayerPublic]
 
 
-class HandOut(BaseModel):
-    player_id: str
+class CreateRoomIn(BaseModel):
+    host_name: str
+
+
+class JoinRoomIn(BaseModel):
     name: str
-    hand: list[CardOut]
-    has_submitted: bool
 
 
-class StartGameIn(BaseModel):
-    player_names: list[str]
+class JudgePickIn(BaseModel):
+    loser_player_id: str
 
 
-class SubmitCardIn(BaseModel):
-    card_id: str
+class RoomJoinedOut(BaseModel):
+    room_code: str
+    player_id: str
+    player_token: str

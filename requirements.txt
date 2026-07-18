@@ -1,5 +1,6 @@
-claude-agent-sdk
 fastapi
 uvicorn
 pydantic
 python-multipart
+openai
+Pillow

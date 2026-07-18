@@ -1,13 +1,11 @@
-"""Card data for Judge: prompt ("black") cards and response ("white") cards."""
+"""Response card data for Judge.
+
+Each card's image lives at /card-images/{id}.png (generated offline by
+scripts/generate_card_images.py) -- the path is derived from the id, not
+stored per card.
+"""
 
 from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class PromptCard:
-    id: str
-    text: str
-    emoji: str = "❓"
 
 
 @dataclass(frozen=True)
@@ -16,27 +14,6 @@ class ResponseCard:
     text: str
     emoji: str
 
-
-PROMPT_CARDS: tuple[PromptCard, ...] = (
-    PromptCard("p01", "The real reason I was late to the wedding: ___.", "💒"),
-    PromptCard("p02", "Grandma's secret family recipe turned out to be ___.", "🍲"),
-    PromptCard("p03", "TSA pulled me aside because of my ___.", "🛂"),
-    PromptCard("p04", "My dating app bio just says '___' and I still get matches.", "📱"),
-    PromptCard("p05", "The new-employee orientation video opened with a slide about ___.", "📽️"),
-    PromptCard("p06", "I got banned from the community pool because of my ___.", "🏊"),
-    PromptCard("p07", "The home inspector's report flagged exactly one thing: ___.", "🏠"),
-    PromptCard("p08", "My eulogy will probably mention my ___.", "🕊️"),
-    PromptCard("p09", "The wellness retreat's icebreaker was 'show the group your ___.'", "🧘"),
-    PromptCard("p10", "Right before the job interview, I forgot to deal with my ___.", "💼"),
-    PromptCard("p11", "The class photo had to be retaken because of someone's ___.", "📸"),
-    PromptCard("p12", "My dating profile's 'red flags' section just lists my ___.", "🚩"),
-    PromptCard("p13", "Instead of flowers, I brought my mother-in-law ___.", "💐"),
-    PromptCard("p14", "The company all-hands ended awkwardly when HR mentioned my ___.", "🏢"),
-    PromptCard("p15", "The airport security scanner lit up because of my ___.", "🛃"),
-    PromptCard("p16", "My yearbook superlative was 'Most Likely to Have ___.'", "📖"),
-    PromptCard("p17", "The bridezilla meltdown started the moment she saw my ___.", "👰"),
-    PromptCard("p18", "The new roommate's first question was about my ___.", "🔑"),
-)
 
 RESPONSE_CARDS: tuple[ResponseCard, ...] = (
     ResponseCard("r01", "Camel toe", "🍑"),
@@ -115,5 +92,4 @@ RESPONSE_CARDS: tuple[ResponseCard, ...] = (
     ResponseCard("r74", "Snake", "🐍"),
 )
 
-PROMPT_BY_ID: dict[str, PromptCard] = {c.id: c for c in PROMPT_CARDS}
 RESPONSE_BY_ID: dict[str, ResponseCard] = {c.id: c for c in RESPONSE_CARDS}

@@ -1,27 +1,31 @@
-const MIN_PLAYERS = 4;
+const SESSION_KEY = "judge_session";
+const POLL_MS = 1500;
 
 const APP = document.getElementById("app");
 const SCOREBOARD = document.getElementById("scoreboard");
+const ROOM_CODE_BADGE = document.getElementById("room-code-badge");
 
-const state = {
-  players: [],
-  prompt: null,
-  phase: null,
-  currentPlayerId: null,
-  lastRoundResult: null,
-};
+let session = loadSession();
+let pollTimer = null;
+let lastSnapshot = null;
+let wakeLock = null;
 
-async function api(method, path, body) {
-  const res = await fetch(path, {
-    method,
-    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data.detail || `Request failed (${res.status})`);
+function loadSession() {
+  try {
+    return JSON.parse(localStorage.getItem(SESSION_KEY));
+  } catch {
+    return null;
   }
-  return data;
+}
+
+function saveSession(s) {
+  session = s;
+  localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+}
+
+function clearSession() {
+  session = null;
+  localStorage.removeItem(SESSION_KEY);
 }
 
 function escapeHtml(str) {
@@ -30,233 +34,350 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-function blankify(text) {
-  return escapeHtml(text).replace("___", '<span class="blank">______</span>');
+async function api(method, path, body, authed = true) {
+  const headers = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (authed && session) {
+    headers["X-Player-Id"] = session.playerId;
+    headers["X-Player-Token"] = session.playerToken;
+  }
+  const res = await fetch(path, {
+    method,
+    headers: Object.keys(headers).length ? headers : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.detail || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
 }
 
-function renderScoreboard() {
-  if (!state.players.length) {
+function renderScoreboard(players) {
+  if (!players || !players.length) {
     SCOREBOARD.classList.add("hidden");
     SCOREBOARD.innerHTML = "";
     return;
   }
-  const sorted = [...state.players].sort((a, b) => b.score - a.score);
+  const sorted = [...players].sort((a, b) => b.score - a.score);
   SCOREBOARD.classList.remove("hidden");
   SCOREBOARD.innerHTML = sorted
-    .map((p) => `<span class="score-pill">${escapeHtml(p.name)}: ${p.score}</span>`)
+    .map(
+      (p) =>
+        `<span class="score-pill${p.is_judge ? " judge" : ""}">${escapeHtml(p.name)}: ${p.score}${p.is_judge ? " ⚖️" : ""}</span>`
+    )
     .join("");
 }
 
-function updateFromGameState(gs) {
-  state.players = gs.players;
-  state.prompt = gs.prompt;
-  state.phase = gs.phase;
-  state.currentPlayerId = gs.current_player_id;
-  state.lastRoundResult = gs.last_round_result;
-  renderScoreboard();
+async function requestWakeLock() {
+  try {
+    if ("wakeLock" in navigator) {
+      wakeLock = await navigator.wakeLock.request("screen");
+    }
+  } catch {
+    wakeLock = null;
+  }
 }
 
-function routeFromPhase() {
-  if (state.phase === "submitting") {
-    renderPassDevice();
-  } else if (state.phase === "judging") {
-    renderAskJudge();
-  } else if (state.phase === "reveal") {
-    renderReveal(state.lastRoundResult);
+function releaseWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(pollState, POLL_MS);
+}
+
+async function pollState() {
+  if (!session) return;
+  try {
+    const data = await api("GET", `/api/rooms/${session.roomCode}/state`);
+    handleStateResponse(data);
+  } catch (err) {
+    if (err.status === 404 || err.status === 403) {
+      stopPolling();
+      clearSession();
+      renderHome("That room is no longer available. Please rejoin.");
+    }
+  }
+}
+
+function handleStateResponse(data) {
+  const snapshot = JSON.stringify(data);
+  if (snapshot === lastSnapshot) return;
+  lastSnapshot = snapshot;
+
+  if (data.phase === "game_over") {
+    renderScoreboard(data.final_scores);
+    ROOM_CODE_BADGE.textContent = data.room_code;
+    ROOM_CODE_BADGE.classList.remove("hidden");
+    renderGameOver(data);
+    return;
+  }
+
+  renderScoreboard(data.players);
+  ROOM_CODE_BADGE.textContent = data.room_code;
+  ROOM_CODE_BADGE.classList.remove("hidden");
+
+  if (data.phase === "lobby") {
+    renderLobby(data);
+  } else if (data.phase === "round") {
+    routeRound(data);
+  } else if (data.phase === "reveal") {
+    renderRoundReveal(data);
+  }
+}
+
+function routeRound(data) {
+  if (data.am_i_judge) {
+    if (data.ready_count < data.players_to_ready) {
+      renderJudgeWaiting(data);
+    } else {
+      renderJudgeReview(data);
+    }
+  } else if (!data.my_ready) {
+    renderMyCard(data);
+  } else {
+    renderWaitingOnOthers(data);
   }
 }
 
 async function init() {
+  if (!session) {
+    renderHome();
+    return;
+  }
   try {
-    const gs = await api("GET", "/api/game");
-    if (gs.phase === "game_over") {
-      state.players = gs.final_scores;
-      renderScoreboard();
-      renderGameOver(gs);
-      return;
-    }
-    updateFromGameState(gs);
-    routeFromPhase();
-  } catch (err) {
-    renderSetup();
+    const data = await api("GET", `/api/rooms/${session.roomCode}/state`);
+    handleStateResponse(data);
+    startPolling();
+  } catch {
+    clearSession();
+    renderHome();
   }
 }
 
-// ---- Setup screen ----
-function renderSetup() {
-  state.players = [];
-  renderScoreboard();
+// ---- Home: create or join a room ----
+function renderHome(message) {
+  stopPolling();
+  releaseWakeLock();
+  lastSnapshot = null;
+  ROOM_CODE_BADGE.classList.add("hidden");
+  renderScoreboard(null);
   APP.innerHTML = `
     <section class="screen">
-      <h2>Start a new game</h2>
-      <p class="hint">Enter at least ${MIN_PLAYERS} player names. Claude will judge every round.</p>
-      <div id="player-inputs"></div>
-      <button id="add-player" type="button">+ Add player</button>
-      <button id="start-game" type="button" class="primary">Start Game</button>
-      <p id="setup-error" class="error hidden"></p>
+      <p class="hint">A Heads Up-style party game &mdash; everyone plays from their own phone.</p>
+      ${message ? `<p class="error">${escapeHtml(message)}</p>` : ""}
+      <div class="home-grid">
+        <div class="home-card">
+          <h3>Host a new game</h3>
+          <input id="host-name" type="text" placeholder="Your name" />
+          <button id="create-room-btn" class="primary">Create Room</button>
+        </div>
+        <div class="home-card">
+          <h3>Join a game</h3>
+          <input id="join-code" type="text" placeholder="Room code" maxlength="4" />
+          <input id="join-name" type="text" placeholder="Your name" />
+          <button id="join-room-btn" class="primary">Join Room</button>
+        </div>
+      </div>
+      <p id="home-error" class="error hidden"></p>
     </section>
   `;
-  const inputsEl = document.getElementById("player-inputs");
 
-  function addInput(value) {
-    const row = document.createElement("div");
-    row.className = "player-input-row";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "player-name";
-    input.placeholder = "Player name";
-    input.value = value || "";
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className = "remove-player";
-    removeBtn.textContent = "✕";
-    removeBtn.addEventListener("click", () => {
-      if (inputsEl.children.length > 1) row.remove();
-    });
-    row.appendChild(input);
-    row.appendChild(removeBtn);
-    inputsEl.appendChild(row);
-  }
+  const errorEl = document.getElementById("home-error");
+  const showError = (msg) => {
+    errorEl.textContent = msg;
+    errorEl.classList.remove("hidden");
+  };
 
-  for (let i = 0; i < MIN_PLAYERS; i++) addInput();
-
-  document.getElementById("add-player").addEventListener("click", () => addInput());
-
-  document.getElementById("start-game").addEventListener("click", async () => {
-    const names = [...inputsEl.querySelectorAll(".player-name")]
-      .map((i) => i.value.trim())
-      .filter(Boolean);
-    const errorEl = document.getElementById("setup-error");
-    if (names.length < MIN_PLAYERS) {
-      errorEl.textContent = `Enter at least ${MIN_PLAYERS} player names.`;
-      errorEl.classList.remove("hidden");
-      return;
-    }
+  document.getElementById("create-room-btn").addEventListener("click", async () => {
+    const name = document.getElementById("host-name").value.trim();
+    if (!name) return showError("Enter your name.");
     try {
-      const gs = await api("POST", "/api/game", { player_names: names });
-      updateFromGameState(gs);
-      routeFromPhase();
+      const joined = await api("POST", "/api/rooms", { host_name: name }, false);
+      saveSession({
+        roomCode: joined.room_code,
+        playerId: joined.player_id,
+        playerToken: joined.player_token,
+      });
+      const state = await api("GET", `/api/rooms/${joined.room_code}/state`);
+      handleStateResponse(state);
+      startPolling();
     } catch (err) {
-      errorEl.textContent = err.message;
-      errorEl.classList.remove("hidden");
+      showError(err.message);
+    }
+  });
+
+  document.getElementById("join-room-btn").addEventListener("click", async () => {
+    const code = document.getElementById("join-code").value.trim().toUpperCase();
+    const name = document.getElementById("join-name").value.trim();
+    if (!code || !name) return showError("Enter the room code and your name.");
+    try {
+      const joined = await api("POST", `/api/rooms/${code}/join`, { name }, false);
+      saveSession({
+        roomCode: joined.room_code,
+        playerId: joined.player_id,
+        playerToken: joined.player_token,
+      });
+      const state = await api("GET", `/api/rooms/${joined.room_code}/state`);
+      handleStateResponse(state);
+      startPolling();
+    } catch (err) {
+      showError(err.message);
     }
   });
 }
 
-// ---- Pass-device interstitial ----
-function renderPassDevice() {
-  const player = state.players.find((p) => p.id === state.currentPlayerId);
+// ---- Lobby ----
+function renderLobby(data) {
+  releaseWakeLock();
+  const isHost = session.playerId === data.host_player_id;
+  const rows = data.players
+    .map((p) => `<li>${escapeHtml(p.name)}${p.id === data.host_player_id ? " (host)" : ""}</li>`)
+    .join("");
+  const canStart = data.players.length >= 4;
+
   APP.innerHTML = `
-    <section class="screen pass-screen">
-      <h2>Pass the device to</h2>
-      <p class="player-name-big">${escapeHtml(player ? player.name : "")}</p>
-      <button id="ready-btn" class="primary">I'm ready</button>
+    <section class="screen lobby-screen">
+      <h2>Waiting for players</h2>
+      <p class="hint">Share this code with everyone:</p>
+      <p class="room-code-big">${escapeHtml(data.room_code)}</p>
+      <ul class="player-list">${rows}</ul>
+      ${
+        isHost
+          ? `<button id="start-btn" class="primary" ${canStart ? "" : "disabled"}>Start Game</button>
+             ${canStart ? "" : `<p class="hint">Need at least 4 players (${data.players.length}/4).</p>`}`
+          : `<p class="hint">Waiting for the host to start the game&hellip;</p>`
+      }
+      <p id="lobby-error" class="error hidden"></p>
+    </section>
+  `;
+
+  if (isHost) {
+    document.getElementById("start-btn").addEventListener("click", async () => {
+      try {
+        lastSnapshot = null;
+        const state = await api("POST", `/api/rooms/${data.room_code}/start`);
+        handleStateResponse(state);
+      } catch (err) {
+        const errorEl = document.getElementById("lobby-error");
+        errorEl.textContent = err.message;
+        errorEl.classList.remove("hidden");
+      }
+    });
+  }
+}
+
+// ---- My card (hold to forehead) ----
+function renderMyCard(data) {
+  requestWakeLock();
+  const card = data.my_card;
+  APP.innerHTML = `
+    <section class="screen forehead-screen">
+      <p class="hint">Hold your phone to your forehead, screen facing out, so everyone else can see it!</p>
+      <div class="forehead-card">
+        <img src="${escapeHtml(card.image_url)}" alt="${escapeHtml(card.text)}" />
+        <p class="forehead-caption">${card.emoji} ${escapeHtml(card.text)}</p>
+      </div>
+      <button id="ready-btn" class="primary">I'm showing it!</button>
     </section>
   `;
   document.getElementById("ready-btn").addEventListener("click", async () => {
     try {
-      const hand = await api("GET", `/api/game/players/${state.currentPlayerId}/hand`);
-      renderHand(hand);
+      lastSnapshot = null;
+      const state = await api("POST", `/api/rooms/${data.room_code}/ready`);
+      handleStateResponse(state);
     } catch (err) {
       alert(err.message);
     }
   });
 }
 
-// ---- Hand view ----
-function renderHand(hand) {
-  let selectedId = null;
+function renderWaitingOnOthers(data) {
   APP.innerHTML = `
-    <section class="screen">
-      <div class="prompt-card">
-        <span class="prompt-emoji">${state.prompt.emoji}</span>
-        <p>${blankify(state.prompt.text)}</p>
-      </div>
-      <h3>${escapeHtml(hand.name)}'s hand</h3>
-      <div id="hand-cards" class="card-grid"></div>
-      <button id="play-card" class="primary" disabled>Play this card</button>
-      <p id="hand-error" class="error hidden"></p>
+    <section class="screen wait-screen">
+      <h2>Keep holding it up!</h2>
+      <p class="hint">Waiting for everyone to reveal (${data.ready_count}/${data.players_to_ready})&hellip;</p>
     </section>
   `;
-  const grid = document.getElementById("hand-cards");
-  const playBtn = document.getElementById("play-card");
-
-  hand.hand.forEach((card) => {
-    const el = document.createElement("button");
-    el.type = "button";
-    el.className = "response-card";
-    el.innerHTML = `<span class="card-emoji">${card.emoji}</span><span>${escapeHtml(card.text)}</span>`;
-    el.addEventListener("click", () => {
-      grid.querySelectorAll(".response-card").forEach((c) => c.classList.remove("selected"));
-      el.classList.add("selected");
-      selectedId = card.id;
-      playBtn.disabled = false;
-    });
-    grid.appendChild(el);
-  });
-
-  playBtn.addEventListener("click", async () => {
-    if (!selectedId) return;
-    playBtn.disabled = true;
-    try {
-      const gs = await api("POST", `/api/game/players/${hand.player_id}/submit`, {
-        card_id: selectedId,
-      });
-      updateFromGameState(gs);
-      routeFromPhase();
-    } catch (err) {
-      const errorEl = document.getElementById("hand-error");
-      errorEl.textContent = err.message;
-      errorEl.classList.remove("hidden");
-      playBtn.disabled = false;
-    }
-  });
 }
 
-// ---- Ask Claude to judge ----
-function renderAskJudge() {
+function renderJudgeWaiting(data) {
+  releaseWakeLock();
+  APP.innerHTML = `
+    <section class="screen wait-screen">
+      <h2>You're the judge this round</h2>
+      <p class="hint">Waiting for everyone to hold up their card (${data.ready_count}/${data.players_to_ready})&hellip;</p>
+    </section>
+  `;
+}
+
+// ---- Judge review: pick the worst card ----
+function renderJudgeReview(data) {
+  releaseWakeLock();
+  const cardsHtml = (data.reveal_cards || [])
+    .map(
+      (s) => `
+        <button type="button" class="reveal-card" data-player-id="${s.player_id}">
+          <img src="${escapeHtml(s.card.image_url)}" alt="${escapeHtml(s.card.text)}" />
+          <span class="reveal-name">${escapeHtml(s.name)}</span>
+        </button>
+      `
+    )
+    .join("");
+
   APP.innerHTML = `
     <section class="screen">
-      <div class="prompt-card">
-        <span class="prompt-emoji">${state.prompt.emoji}</span>
-        <p>${blankify(state.prompt.text)}</p>
-      </div>
-      <p class="hint">Everyone has submitted a card.</p>
-      <button id="judge-btn" class="primary">Ask Claude to judge</button>
-      <p id="judge-loading" class="hint hidden">Claude is deliberating&hellip;</p>
+      <h2>Pick the worst one!</h2>
+      <p class="hint">Look at everyone's forehead and tap the worst pic.</p>
+      <div class="reveal-grid">${cardsHtml}</div>
       <p id="judge-error" class="error hidden"></p>
     </section>
   `;
-  document.getElementById("judge-btn").addEventListener("click", async () => {
-    document.getElementById("judge-btn").disabled = true;
-    document.getElementById("judge-loading").classList.remove("hidden");
-    try {
-      const result = await api("POST", "/api/game/judge", {});
-      state.lastRoundResult = result;
-      state.players = result.scores;
-      renderScoreboard();
-      renderReveal(result);
-    } catch (err) {
-      document.getElementById("judge-error").textContent = err.message;
-      document.getElementById("judge-error").classList.remove("hidden");
-      document.getElementById("judge-btn").disabled = false;
-      document.getElementById("judge-loading").classList.add("hidden");
-    }
+
+  document.querySelectorAll(".reveal-card").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      document.querySelectorAll(".reveal-card").forEach((b) => (b.disabled = true));
+      try {
+        lastSnapshot = null;
+        const state = await api("POST", `/api/rooms/${data.room_code}/judge/pick`, {
+          loser_player_id: btn.dataset.playerId,
+        });
+        handleStateResponse(state);
+      } catch (err) {
+        const errorEl = document.getElementById("judge-error");
+        errorEl.textContent = err.message;
+        errorEl.classList.remove("hidden");
+        document.querySelectorAll(".reveal-card").forEach((b) => (b.disabled = false));
+      }
+    });
   });
 }
 
-// ---- Reveal ----
-function renderReveal(result) {
+// ---- Round reveal ----
+function renderRoundReveal(data) {
+  releaseWakeLock();
+  const result = data.last_round_result;
   const submissionsHtml = result.submissions
     .map((s) => {
-      const isWinner = s.player_id === result.winner.player_id;
+      const isLoser = s.player_id === result.loser.player_id;
       return `
-        <div class="submission ${isWinner ? "winner" : ""}">
-          <div class="response-card static">
-            <span class="card-emoji">${s.card.emoji}</span>
-            <span>${escapeHtml(s.card.text)}</span>
-          </div>
-          <p class="submission-name">${escapeHtml(s.name)}${isWinner ? " \u{1F3C6}" : ""}</p>
+        <div class="submission ${isLoser ? "loser" : ""}">
+          <img src="${escapeHtml(s.card.image_url)}" alt="${escapeHtml(s.card.text)}" />
+          <p class="submission-name">${escapeHtml(s.name)}${isLoser ? " \u{1F447}" : ""}</p>
         </div>
       `;
     })
@@ -264,30 +385,17 @@ function renderReveal(result) {
 
   APP.innerHTML = `
     <section class="screen">
-      <div class="prompt-card">
-        <span class="prompt-emoji">${result.prompt.emoji}</span>
-        <p>${blankify(result.prompt.text)}</p>
-      </div>
-      ${result.judge_error ? '<p class="error">Claude had trouble judging this round, so a winner was picked at random.</p>' : ""}
-      <div class="roast-box">
-        <p class="roast-label">The Judge says:</p>
-        <p class="roast-text">&ldquo;${escapeHtml(result.roast)}&rdquo;</p>
-      </div>
+      <h2>${escapeHtml(result.judge_name)} judged&hellip;</h2>
+      <p class="hint">Worst pic of the round: <strong>${escapeHtml(result.loser.name)}</strong> (+1 point)</p>
       <div class="submissions-grid">${submissionsHtml}</div>
       <button id="next-round-btn" class="primary">Next Round</button>
     </section>
   `;
   document.getElementById("next-round-btn").addEventListener("click", async () => {
     try {
-      const gs = await api("POST", "/api/game/next-round", {});
-      if (gs.phase === "game_over") {
-        state.players = gs.final_scores;
-        renderScoreboard();
-        renderGameOver(gs);
-      } else {
-        updateFromGameState(gs);
-        routeFromPhase();
-      }
+      lastSnapshot = null;
+      const state = await api("POST", `/api/rooms/${data.room_code}/next-round`);
+      handleStateResponse(state);
     } catch (err) {
       alert(err.message);
     }
@@ -295,21 +403,34 @@ function renderReveal(result) {
 }
 
 // ---- Game over ----
-function renderGameOver(gs) {
-  const rows = gs.final_scores
+function renderGameOver(data) {
+  releaseWakeLock();
+  const isHost = session.playerId === data.host_player_id;
+  const rows = data.final_scores
     .map((p) => `<li>${escapeHtml(p.name)} &mdash; ${p.score}</li>`)
     .join("");
   APP.innerHTML = `
     <section class="screen">
-      <h2>\u{1F3C6} ${escapeHtml(gs.winner.name)} wins!</h2>
+      <h2>\u{1F3C6} ${escapeHtml(data.winner.name)} wins!</h2>
       <ol class="final-scores">${rows}</ol>
-      <button id="new-game-btn" class="primary">New Game</button>
+      ${
+        isHost
+          ? `<button id="new-game-btn" class="primary">Play Again</button>`
+          : `<p class="hint">Waiting for the host to start a new game&hellip;</p>`
+      }
     </section>
   `;
-  document.getElementById("new-game-btn").addEventListener("click", async () => {
-    await api("POST", "/api/game/reset", {});
-    renderSetup();
-  });
+  if (isHost) {
+    document.getElementById("new-game-btn").addEventListener("click", async () => {
+      try {
+        lastSnapshot = null;
+        const state = await api("POST", `/api/rooms/${data.room_code}/new-game`);
+        handleStateResponse(state);
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+  }
 }
 
 init();
