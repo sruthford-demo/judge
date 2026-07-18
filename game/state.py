@@ -265,10 +265,14 @@ class RoomManager:
         async with self._lock_for(code):
             room = await self._get_room(code)
             self._authorize(room, player_id, token)
+            if room.phase != "game_over":
+                raise InvalidPhaseError("The current game hasn't finished yet.")
             for p in room.players:
                 p.score = 0
                 p.card_id = None
             room.last_round_result = None
+            room.response_deck = [c.id for c in RESPONSE_CARDS]
+            random.shuffle(room.response_deck)
             room.response_discard = []
             self._begin_round(room, 1)
             await self._store.set(code, room.to_dict())
