@@ -1,15 +1,17 @@
-"""In-memory multi-room state and round lifecycle for Judge.
+"""Room state and round lifecycle for Judge.
 
-Rooms live in a process-wide dict keyed by room code -- no external store.
-This is a known, accepted tradeoff on Vercel's stateless serverless functions:
-state can occasionally reset under real concurrent multi-device load (a cold
-start, or requests landing on a different warm instance). Running
-`python main.py` locally (one process) is far more reliable for an actual
-in-person game than the Vercel deployment.
+Rooms are persisted through a RoomStore (game/store.py) keyed by room code --
+Redis-backed on Vercel (survives across serverless instances), an in-memory
+dict when running locally with no store credentials configured.
 
-Every mutating RoomManager method takes the room's own asyncio.Lock so a
-double-tapped button can't corrupt that room's state; separate rooms don't
-block each other.
+Each mutating RoomManager method loads the room, mutates it, and saves it
+back. There's no distributed lock across instances -- a deliberate
+simplification: actions here are human-paced and single-actor (only the
+current judge can judge_pick, ready-up is per-player), so the realistic
+collision window is tiny, and the worst case (e.g. two near-simultaneous
+"Next Round" taps) just raises InvalidPhaseError for the loser, which the
+UI already handles by re-polling. An asyncio.Lock per room code still
+guards against literal double-taps landing on the same warm instance.
 """
 
 import asyncio
@@ -28,6 +30,7 @@ from .schemas import (
     RoundResultOut,
     SubmissionOut,
 )
+from .store import RoomStore, build_default_store
 
 MIN_PLAYERS = 4
 TARGET_SCORE = 5
@@ -93,12 +96,51 @@ class Room:
     response_discard: list[str] = field(default_factory=list)
     last_round_result: RoundResultOut | None = None
     target_score: int = TARGET_SCORE
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "host_player_id": self.host_player_id,
+            "players": [vars(p) for p in self.players],
+            "phase": self.phase,
+            "round_number": self.round_number,
+            "judge_player_id": self.judge_player_id,
+            "response_deck": self.response_deck,
+            "response_discard": self.response_discard,
+            "last_round_result": (
+                self.last_round_result.model_dump() if self.last_round_result else None
+            ),
+            "target_score": self.target_score,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Room":
+        last_round_result = (
+            RoundResultOut.model_validate(data["last_round_result"])
+            if data["last_round_result"]
+            else None
+        )
+        return cls(
+            code=data["code"],
+            host_player_id=data["host_player_id"],
+            players=[Player(**p) for p in data["players"]],
+            phase=data["phase"],
+            round_number=data["round_number"],
+            judge_player_id=data["judge_player_id"],
+            response_deck=data["response_deck"],
+            response_discard=data["response_discard"],
+            last_round_result=last_round_result,
+            target_score=data["target_score"],
+        )
 
 
 class RoomManager:
-    def __init__(self) -> None:
-        self._rooms: dict[str, Room] = {}
+    def __init__(self, store: RoomStore | None = None) -> None:
+        self._store = store or build_default_store()
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, code: str) -> asyncio.Lock:
+        return self._locks.setdefault(code, asyncio.Lock())
 
     # -- room lifecycle -------------------------------------------------------
 
@@ -106,15 +148,16 @@ class RoomManager:
         name = host_name.strip()
         if not name:
             raise GameError("Host name is required.")
-        code = self._new_room_code()
+        code = await self._new_room_code()
         host = Player(id=_new_id(), name=name, token=_new_token())
         room = Room(code=code, host_player_id=host.id, players=[host])
-        self._rooms[code] = room
+        await self._store.set(code, room.to_dict())
         return room, host
 
     async def join_room(self, code: str, name: str) -> tuple[Room, Player]:
-        room = self._get_room(code)
-        async with room.lock:
+        code = code.upper()
+        async with self._lock_for(code):
+            room = await self._get_room(code)
             if room.phase != "lobby":
                 raise InvalidPhaseError("This game has already started.")
             name = name.strip()
@@ -124,11 +167,13 @@ class RoomManager:
                 raise DuplicateNameError("That name is already taken in this room.")
             player = Player(id=_new_id(), name=name, token=_new_token())
             room.players.append(player)
+            await self._store.set(code, room.to_dict())
             return room, player
 
     async def start_game(self, code: str, player_id: str, token: str) -> RoomStateOut:
-        room = self._get_room(code)
-        async with room.lock:
+        code = code.upper()
+        async with self._lock_for(code):
+            room = await self._get_room(code)
             self._authorize(room, player_id, token)
             if player_id != room.host_player_id:
                 raise NotHostError("Only the host can start the game.")
@@ -140,18 +185,20 @@ class RoomManager:
             room.response_deck = [c.id for c in RESPONSE_CARDS]
             random.shuffle(room.response_deck)
             self._begin_round(room, 1)
+            await self._store.set(code, room.to_dict())
             return self._state_out(room, player_id)
 
-    def get_state(self, code: str, player_id: str, token: str) -> RoomStateOut | GameOverOut:
-        room = self._get_room(code)
+    async def get_state(self, code: str, player_id: str, token: str) -> RoomStateOut | GameOverOut:
+        room = await self._get_room(code.upper())
         self._authorize(room, player_id, token)
         if room.phase == "game_over":
             return self._game_over_out(room)
         return self._state_out(room, player_id)
 
     async def set_ready(self, code: str, player_id: str, token: str) -> RoomStateOut:
-        room = self._get_room(code)
-        async with room.lock:
+        code = code.upper()
+        async with self._lock_for(code):
+            room = await self._get_room(code)
             self._authorize(room, player_id, token)
             if room.phase != "round":
                 raise InvalidPhaseError("There's no active round to ready up for.")
@@ -159,13 +206,15 @@ class RoomManager:
                 raise NotJudgeError("The judge doesn't hold up a card.")
             player = self._find_player(room, player_id)
             player.ready = True
+            await self._store.set(code, room.to_dict())
             return self._state_out(room, player_id)
 
     async def judge_pick(
         self, code: str, judge_player_id: str, token: str, loser_player_id: str
     ) -> RoomStateOut:
-        room = self._get_room(code)
-        async with room.lock:
+        code = code.upper()
+        async with self._lock_for(code):
+            room = await self._get_room(code)
             self._authorize(room, judge_player_id, token)
             if room.phase != "round":
                 raise InvalidPhaseError("There's no active round to judge.")
@@ -197,27 +246,32 @@ class RoomManager:
             )
             room.response_discard.extend(p.card_id for p in non_judges if p.card_id)
             room.phase = "reveal"
+            await self._store.set(code, room.to_dict())
             return self._state_out(room, judge_player_id)
 
     async def next_round(
         self, code: str, player_id: str, token: str
     ) -> RoomStateOut | GameOverOut:
-        room = self._get_room(code)
-        async with room.lock:
+        code = code.upper()
+        async with self._lock_for(code):
+            room = await self._get_room(code)
             self._authorize(room, player_id, token)
             if room.phase != "reveal":
                 raise InvalidPhaseError("The current round hasn't been judged yet.")
 
             if any(p.score >= room.target_score for p in room.players):
                 room.phase = "game_over"
+                await self._store.set(code, room.to_dict())
                 return self._game_over_out(room)
 
             self._begin_round(room, room.round_number + 1)
+            await self._store.set(code, room.to_dict())
             return self._state_out(room, player_id)
 
     async def new_game(self, code: str, player_id: str, token: str) -> RoomStateOut:
-        room = self._get_room(code)
-        async with room.lock:
+        code = code.upper()
+        async with self._lock_for(code):
+            room = await self._get_room(code)
             self._authorize(room, player_id, token)
             if player_id != room.host_player_id:
                 raise NotHostError("Only the host can start a new game.")
@@ -228,21 +282,22 @@ class RoomManager:
             room.last_round_result = None
             room.response_discard = []
             self._begin_round(room, 1)
+            await self._store.set(code, room.to_dict())
             return self._state_out(room, player_id)
 
     # -- internal helpers -------------------------------------------------------
 
-    def _new_room_code(self) -> str:
+    async def _new_room_code(self) -> str:
         while True:
             code = "".join(secrets.choice(ROOM_CODE_CHARS) for _ in range(ROOM_CODE_LENGTH))
-            if code not in self._rooms:
+            if await self._store.get(code) is None:
                 return code
 
-    def _get_room(self, code: str) -> Room:
-        room = self._rooms.get(code.upper())
-        if room is None:
+    async def _get_room(self, code: str) -> Room:
+        data = await self._store.get(code)
+        if data is None:
             raise RoomNotFoundError(f"No room with code {code!r}.")
-        return room
+        return Room.from_dict(data)
 
     def _authorize(self, room: Room, player_id: str, token: str) -> Player:
         player = self._find_player(room, player_id)

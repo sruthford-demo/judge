@@ -43,7 +43,7 @@ async def join_room(code: str, body: JoinRoomIn) -> RoomJoinedOut:
 
 @app.get("/api/rooms/{code}/state", response_model=RoomStateOut | GameOverOut)
 async def get_state(code: str, player_id: str = Header(..., alias="X-Player-Id"), player_token: str = Header(..., alias="X-Player-Token")) -> RoomStateOut | GameOverOut:
-    return manager.get_state(code, player_id, player_token)
+    return await manager.get_state(code, player_id, player_token)
 
 
 @app.post("/api/rooms/{code}/start", response_model=RoomStateOut)
